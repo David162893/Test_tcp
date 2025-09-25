@@ -8,6 +8,7 @@ import requests
 import threading
 import queue
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from NetSDK.NetSDK import (
     NetClient,
     NET_IN_LOGIN_WITH_HIGHLEVEL_SECURITY,
@@ -18,7 +19,7 @@ from NetSDK.NetSDK import (
 )
 
 # ==========================================================
-# Detecta si se ejecuta como .exe (PyInstaller) o script .py
+# Detect if running as .exe (PyInstaller) or .py script
 # ==========================================================
 if getattr(sys, 'frozen', False):
     base_path = sys._MEIPASS
@@ -27,50 +28,46 @@ else:
     base_path = os.path.dirname(os.path.abspath(__file__))
     script_path = base_path
 
+STATE_FILE = Path(script_path) / "state.json"  # File to save the last event timestamp
+
 # ==========================================================
-# Devuelve la ruta absoluta del archivo config.ini
+# Get the absolute path to config.ini
 # ==========================================================
 def get_config_path():
     return os.path.join(base_path, 'config', 'config.ini')
 
 # ==========================================================
-# Verifica que la librería NetSDK esté disponible
+# Verify that NetSDK library is available
 # ==========================================================
 def verify_dependencies():
     try:
         import NetSDK.NetSDK
-        logging.info("Dependencia NetSDK encontrada.")
+        logging.info("NetSDK found.")
         return True
     except ImportError as e:
-        logging.error(f"Dependencia faltante: {e}")
+        logging.error(f"Missing dependency: {e}")
         return False
 
 # ==========================================================
-# Clase principal TCPTestService
+# Main service class
 # ==========================================================
 class TCPTestService:
-    """
-    Servicio TCP para conectar con dispositivos Dahua y enviar eventos a la API de Frappe.
-    - Lee configuración desde config.ini.
-    - Soporta modo cíclico o permanente.
-    - Maneja logs de errores, eventos e info.
-    - Envía eventos a la API en un hilo separado mediante una cola.
-    """
 
+    # ==========================================================
+    # Service initialization
+    # ==========================================================
     def __init__(self):
-        # ------------------------------
-        # Leer configuración
-        # ------------------------------
         self.config_path = get_config_path()
         self.config = configparser.ConfigParser()
         self.config.read(self.config_path)
 
+        # Basic configuration
         self.username = self.config.get('DEFAULT', 'username', fallback='admin')
         self.password = self.config.get('DEFAULT', 'password', fallback='admin')
-        self.mode = self.config.get('DEFAULT', 'mode', fallback='permanente').lower()
+        self.mode = self.config.get('DEFAULT', 'mode', fallback='permanent').lower()
         self.interval = int(self.config.get('DEFAULT', 'interval_seconds', fallback='1'))
 
-        # Lista de pares IP:Puerto de dispositivos Dahua
+        # Device IP:Port list
         self.ip_port_pairs = []
         pairs_str = self.config.get('DEFAULT', 'ip_port_pairs', fallback=None)
         if pairs_str:
@@ -82,17 +79,13 @@ class TCPTestService:
                     except Exception:
                         pass
 
-        # ------------------------------
-        # Configuración de API Frappe
-        # ------------------------------
+        # API configuration
         self.api_url = self.config.get('DEFAULT', 'api_url', fallback=None)
         self.api_key = self.config.get('DEFAULT', 'api_key', fallback=None)
         self.api_secret = self.config.get('DEFAULT', 'api_secret', fallback=None)
         self.api_max_retries = int(self.config.get('DEFAULT', 'api_max_retries', fallback='3'))
 
-        # ------------------------------
-        # Configuración de logs
-        # ------------------------------
+        # Logging setup
         log_dir = os.path.join(script_path, "logs")
         os.makedirs(log_dir, exist_ok=True)
 
@@ -101,16 +94,12 @@ class TCPTestService:
         self.info_logger = self._build_logger("Info", "info.log", logging.INFO, to_console=True)
         self.event_logger = self._build_logger("Events", "events.log", logging.INFO, fmt='%(asctime)s - %(message)s', to_console=True)
 
-        # ------------------------------
-        # Cola para eventos API
-        # ------------------------------
-        self.api_queue = queue.Queue()  # Cola de eventos que serán enviados a Frappe
+        # API queue and thread
+        self.api_queue = queue.Queue()
         self.api_thread = threading.Thread(target=self._process_api_queue, daemon=True)
-        self.api_thread.start()  # Inicia el hilo de envío asíncrono
+        self.api_thread.start()
 
-        # ------------------------------
-        # Redirigir stderr a log
-        # ------------------------------
+        # Redirect stderr to logger
         class StderrToLogger:
             def __init__(self, logger): self.logger = logger
             def write(self, message):
@@ -122,27 +111,19 @@ class TCPTestService:
         self._running = True
 
     # ==========================================================
-    # Crea un logger con rotación de archivos
+    # Create logger with rotation
     # ==========================================================
     def _build_logger(self, name, filename, level=logging.INFO, fmt=None, to_console=True):
-        """
-        name: nombre del logger
-        filename: archivo de log
-        level: nivel de log
-        fmt: formato del mensaje
-        to_console: si se imprime por consola
-        """
         logger = logging.getLogger(name)
         logger.handlers = []
         logger.setLevel(level)
 
-        # LazyFileHandler: solo crea archivo si hay información para escribir
+        # Lazy handler, creates file only when first log occurs
         class LazyFileHandler(logging.Handler):
             def __init__(self, filepath, level=logging.INFO):
                 super().__init__(level)
                 self.filepath = filepath
                 self._handler = None
-
             def emit(self, record):
                 if not self._handler:
                     os.makedirs(os.path.dirname(self.filepath), exist_ok=True)
@@ -167,19 +148,41 @@ class TCPTestService:
         return logger
 
     # ==========================================================
-    # Enviar eventos a la API (hilo asíncrono)
+    # Save last event timestamp
+    # ==========================================================
+    def save_state(self, last_event_time=None):
+        state = {"last_event_time": last_event_time.isoformat() if last_event_time else None}
+        try:
+            with open(STATE_FILE, "w", encoding="utf-8") as f:
+                json.dump(state, f)
+        except Exception as e:
+            self.error_logger.error(f"[State] Error saving state: {e}")
+
+    # ==========================================================
+    # Load last event timestamp
+    # ==========================================================
+    def load_state(self):
+        if STATE_FILE.exists():
+            try:
+                with open(STATE_FILE, "r", encoding="utf-8") as f:
+                    state = json.load(f)
+                    last_event_time = state.get("last_event_time")
+                    if last_event_time:
+                        from datetime import datetime
+                        return datetime.fromisoformat(last_event_time)
+            except Exception as e:
+                self.error_logger.error(f"[State] Error loading state: {e}")
+        return None
+
+    # ==========================================================
+    # Process API queue in separate thread
     # ==========================================================
     def _process_api_queue(self):
-        """
-        Función que corre en un hilo separado.
-        Toma eventos de la cola y los envía a la API de Frappe con reintentos.
-        No bloquea el flujo principal.
-        """
         while self._running:
             try:
-                data = self.api_queue.get(timeout=1)  # Espera un evento en la cola
+                data = self.api_queue.get(timeout=1)
             except queue.Empty:
-                continue  # Si no hay eventos, sigue el loop
+                continue
 
             headers = {
                 "Authorization": f"token {self.api_key}:{self.api_secret}",
@@ -191,67 +194,69 @@ class TCPTestService:
                 try:
                     resp = requests.post(self.api_url, json=data, headers=headers, timeout=5, verify=True)
                     if resp.status_code == 200:
-                        self.info_logger.info(f"[API] Evento enviado: {data}")
+                        self.info_logger.info(f"[API] Event sent: {data}")
                         break
                     else:
                         self.error_logger.error(f"[API] Error ({resp.status_code}): {resp.text}")
                 except requests.exceptions.SSLError as e:
-                    self.error_logger.error(f"[SSL] Error de certificado: {e}")
+                    self.error_logger.error(f"[SSL] Certificate error: {e}")
                 except requests.exceptions.RequestException as e:
-                    self.error_logger.error(f"[API] Excepción al enviar: {e}")
+                    self.error_logger.error(f"[API] Exception sending event: {e}")
 
                 attempt += 1
-                time.sleep(5)  # Reintento después de 5s
+                time.sleep(5)  # Wait before retry
 
             else:
-                self.error_logger.error(f"[API] No se pudo enviar después de {self.api_max_retries} intentos: {data}")
+                self.error_logger.error(f"[API] Failed to send after {self.api_max_retries} attempts: {data}")
 
             self.api_queue.task_done()
 
     # ==========================================================
-    # Añade un evento a la cola de envío
+    # Enqueue event and save last timestamp
     # ==========================================================
     def enqueue_event(self, data):
-        """
-        data: diccionario JSON del evento
-        """
         self.api_queue.put(data)
+        # Save last event time if exists in event
+        event_time_str = data.get("timestamp") or data.get("Time")  # Adjust key according to your events
+        if event_time_str:
+            try:
+                from datetime import datetime
+                event_time = datetime.fromisoformat(event_time_str)
+                self.save_state(event_time)
+            except Exception:
+                pass
 
     # ==========================================================
-    # Ejecutar servicio según modo configurado
+    # Run service according to mode
     # ==========================================================
     def run(self):
-        if self.mode == 'permanente' or self.interval == 0:
-            self.info_logger.info("TCPTestService ejecutando en modo permanente (NetSDK)")
+        if self.mode == 'permanent' or self.interval == 0:
+            self.info_logger.info("TCPTestService running in permanent mode (NetSDK)")
             self.netsdk_event_loop(once=False)
         else:
-            self.info_logger.info(f"TCPTestService ejecutando en modo cíclico cada {self.interval}s (NetSDK)")
+            self.info_logger.info(f"TCPTestService running in cycle mode every {self.interval}s (NetSDK)")
             while self._running:
                 try:
                     self.netsdk_event_loop(once=True)
                     time.sleep(self.interval)
                 except Exception as e:
-                    self.error_logger.error(f"Error en monitoreo: {e}", exc_info=True)
+                    self.error_logger.error(f"Monitoring error: {e}", exc_info=True)
                     time.sleep(2)
 
     # ==========================================================
-    # Bucle de eventos NetSDK
+    # NetSDK event loop
     # ==========================================================
     def netsdk_event_loop(self, once=False):
-        """
-        Inicializa NetSDK y callbacks de eventos, reconexión y desconexión.
-        Envía eventos a la cola para que el hilo de API los procese.
-        """
+        # Callback for disconnect
         def on_disconnect(login_id, dvr_ip, dvr_port, user_data):
-            self.conn_error_logger.error(f"[NetSDK] Desconectado de {dvr_ip.decode()}:{dvr_port}")
+            self.conn_error_logger.error(f"[NetSDK] Disconnected from {dvr_ip.decode()}:{dvr_port}")
 
+        # Callback for reconnect
         def on_reconnect(login_id, dvr_ip, dvr_port, user_data):
-            self.conn_error_logger.error(f"[NetSDK] Reconectado a {dvr_ip.decode()}:{dvr_port}")
+            self.conn_error_logger.error(f"[NetSDK] Reconnected to {dvr_ip.decode()}:{dvr_port}")
 
+        # Callback for messages / events
         def on_message(command, login_id, pBuf, dwBufLen, pchDVRIP, nDVRPort, bAlarmAckFlag, nEventID, user_data):
-            """
-            Callback de mensajes. Decodifica bytes a JSON y lo encola para la API.
-            """
             try:
                 raw_msg = bytes(pBuf[:dwBufLen]).decode(errors='ignore')
                 try:
@@ -259,18 +264,19 @@ class TCPTestService:
                 except json.JSONDecodeError:
                     data = None
                 if data:
-                    self.enqueue_event(data)  # Se añade a la cola, no se envía directamente
-                    self.event_logger.info(f"[NetSDK] Evento encolado: {data}")
+                    self.enqueue_event(data)  # Add to API queue
+                    self.event_logger.info(f"[NetSDK] Event enqueued: {data}")
                 else:
-                    self.event_logger.info(f"[NetSDK] Evento sin JSON válido: {raw_msg}")
+                    self.event_logger.info(f"[NetSDK] Event invalid JSON: {raw_msg}")
             except Exception as e:
-                self.error_logger.error(f"Error interpretando evento: {e}", exc_info=True)
+                self.error_logger.error(f"Error parsing event: {e}", exc_info=True)
 
         client = NetClient()
         client.InitEx(fDisConnect(on_disconnect))
         client.SetAutoReconnect(fHaveReConnect(on_reconnect))
         client.SetDVRMessCallBackEx1(fMessCallBackEx1(on_message), 0)
 
+        # Connect to all devices
         for ip, port in self.ip_port_pairs:
             try:
                 in_param = NET_IN_LOGIN_WITH_HIGHLEVEL_SECURITY()
@@ -284,16 +290,17 @@ class TCPTestService:
 
                 login_id, device_info, err = client.LoginWithHighLevelSecurity(in_param, out_param)
                 if not login_id:
-                    self.conn_error_logger.error(f"[NetSDK] ❌ Login fallido a {ip}:{port}: {err}")
+                    self.conn_error_logger.error(f"[NetSDK] ❌ Login failed {ip}:{port}: {err}")
                     continue
 
-                self.info_logger.info(f"[NetSDK] Login OK a {ip}:{port}")
+                self.info_logger.info(f"[NetSDK] Login OK {ip}:{port}")
                 client.StartListenEx(login_id)
-                self.info_logger.info(f"[NetSDK] Escuchando eventos en {ip}:{port}")
+                self.info_logger.info(f"[NetSDK] Listening events {ip}:{port}")
 
             except Exception as e:
-                self.conn_error_logger.error(f"[NetSDK] ❌ Error con {ip}:{port}: {e}")
+                self.conn_error_logger.error(f"[NetSDK] ❌ Error {ip}:{port}: {e}")
 
+        # Loop or single run
         if once:
             time.sleep(2)
             client.Cleanup()
@@ -302,17 +309,17 @@ class TCPTestService:
                 while self._running:
                     time.sleep(1)
             except KeyboardInterrupt:
-                print("[NetSDK] Servicio detenido por usuario")
+                print("[NetSDK] Service stopped by user")
             finally:
                 client.Cleanup()
 
 # ==========================================================
-# Punto de entrada
+# Entry point
 # ==========================================================
 if __name__ == "__main__":
-    print("[INFO] Ejecutando TCPTestService en modo consola")
+    print("[INFO] Running TCPTestService in console mode")
     if not verify_dependencies():
-        print("Error: Dependencias faltantes. Verifique el log.")
+        print("Error: Missing dependencies. Check logs.")
         sys.exit(1)
     service = TCPTestService()
     service.run()
